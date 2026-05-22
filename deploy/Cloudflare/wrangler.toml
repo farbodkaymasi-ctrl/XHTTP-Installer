@@ -1,0 +1,12 @@
+name = "xhttp-relay"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Worker will be deployed to Cloudflare's edge network
+# Routes will be configured via CLI during deployment
+
+[env.production]
+name = "xhttp-relay-production"
+
+[env.staging]
+name = "xhttp-relay-staging"
