@@ -624,6 +624,7 @@ phase3_collect_input() {
   # ── Platform credentials ─────────────────────────────────
   local rand_proj
   rand_proj="relay-$(cat /dev/urandom | tr -dc 'a-z0-9' 2>/dev/null | head -c8 || true)"
+  
   if [[ "$CFG_PLATFORM" == "vercel" ]]; then
     echo -e "\n  ${C_CYAN}[ Vercel Deployment ]${C_RESET}"
     CFG_VERCEL_TOKEN=""
@@ -635,7 +636,11 @@ phase3_collect_input() {
     CFG_VERCEL_SCOPE=$(read_default "Vercel scope/team slug (leave blank for personal)" "")
     CFG_NETLIFY_TOKEN=""
     CFG_NETLIFY_SITE=""
-  else
+    CFG_CLOUDFLARE_API_TOKEN=""
+    CFG_CLOUDFLARE_ACCOUNT_ID=""
+    CFG_CLOUDFLARE_WORKER_NAME=""
+    
+  elif [[ "$CFG_PLATFORM" == "netlify" ]]; then
     echo -e "\n  ${C_CYAN}[ Netlify Deployment ]${C_RESET}"
     CFG_NETLIFY_TOKEN=""
     while [[ -z "${CFG_NETLIFY_TOKEN// }" ]]; do
@@ -646,6 +651,29 @@ phase3_collect_input() {
     CFG_VERCEL_TOKEN=""
     CFG_PROJECT_NAME=""
     CFG_VERCEL_SCOPE=""
+    CFG_CLOUDFLARE_API_TOKEN=""
+    CFG_CLOUDFLARE_ACCOUNT_ID=""
+    CFG_CLOUDFLARE_WORKER_NAME=""
+    
+  else
+    # Cloudflare Workers
+    echo -e "\n  ${C_CYAN}[ Cloudflare Workers Deployment ]${C_RESET}"
+    CFG_CLOUDFLARE_API_TOKEN=""
+    while [[ -z "${CFG_CLOUDFLARE_API_TOKEN// }" ]]; do
+      read -rp "$(echo -e "  ${C_WHITE}Cloudflare API Token (dash.cloudflare.com → My Profile → API Tokens)${C_RESET}: ")" CFG_CLOUDFLARE_API_TOKEN
+      [[ -z "${CFG_CLOUDFLARE_API_TOKEN// }" ]] && fail "Required field."
+    done
+    CFG_CLOUDFLARE_ACCOUNT_ID=""
+    while [[ -z "${CFG_CLOUDFLARE_ACCOUNT_ID// }" ]]; do
+      read -rp "$(echo -e "  ${C_WHITE}Cloudflare Account ID (Workers & Pages → Overview)${C_RESET}: ")" CFG_CLOUDFLARE_ACCOUNT_ID
+      [[ -z "${CFG_CLOUDFLARE_ACCOUNT_ID// }" ]] && fail "Required field."
+    done
+    CFG_CLOUDFLARE_WORKER_NAME=$(read_default "Cloudflare Worker name" "$rand_proj")
+    CFG_VERCEL_TOKEN=""
+    CFG_PROJECT_NAME=""
+    CFG_VERCEL_SCOPE=""
+    CFG_NETLIFY_TOKEN=""
+    CFG_NETLIFY_SITE=""
   fi
 
   # ── Performance ─────────────────────────────────────────
@@ -658,8 +686,18 @@ phase3_collect_input() {
     CFG_SUCCESS_LOG=$(read_default       "SUCCESS_LOG_SAMPLE_RATE" "0")
     CFG_SUCCESS_DUR=$(read_default       "SUCCESS_LOG_MIN_DURATION_MS" "3000")
     CFG_ERROR_INT=$(read_default         "ERROR_LOG_MIN_INTERVAL_MS"  "5000")
+  elif [[ "$CFG_PLATFORM" == "cloudflare" ]]; then
+    # Cloudflare Workers: use optimized defaults
+    CFG_MAX_INFLIGHT="256"
+    CFG_MAX_UP_BPS="5242880"
+    CFG_MAX_DOWN_BPS="5242880"
+    CFG_UPSTREAM_TIMEOUT="60000"
+    CFG_SUCCESS_LOG="0"
+    CFG_SUCCESS_DUR="2000"
+    CFG_ERROR_INT="3000"
+    info "Performance settings: using Cloudflare-optimized defaults"
   else
-    # Netlify: use sensible defaults silently (edge function handles its own tuning)
+    # Netlify: use sensible defaults silently
     CFG_MAX_INFLIGHT="128"
     CFG_MAX_UP_BPS="2621440"
     CFG_MAX_DOWN_BPS="2621440"
@@ -678,12 +716,17 @@ phase3_collect_input() {
   echo -e "  ${C_WHITE}Inbound port    :${C_RESET} $CFG_INBOUND_PORT"
   echo -e "  ${C_WHITE}RELAY_PATH      :${C_RESET} $CFG_RELAY_PATH"
   echo -e "  ${C_WHITE}PUBLIC_PATH     :${C_RESET} $CFG_PUBLIC_PATH"
+  
   if [[ "$CFG_PLATFORM" == "vercel" ]]; then
     echo -e "  ${C_WHITE}Vercel project  :${C_RESET} $CFG_PROJECT_NAME"
     [[ -n "$CFG_VERCEL_SCOPE" ]] && echo -e "  ${C_WHITE}Vercel scope    :${C_RESET} $CFG_VERCEL_SCOPE"
-  else
+  elif [[ "$CFG_PLATFORM" == "netlify" ]]; then
     echo -e "  ${C_WHITE}Netlify site    :${C_RESET} $CFG_NETLIFY_SITE"
+  else
+    echo -e "  ${C_WHITE}Worker name     :${C_RESET} $CFG_CLOUDFLARE_WORKER_NAME"
+    echo -e "  ${C_WHITE}Account ID      :${C_RESET} ${CFG_CLOUDFLARE_ACCOUNT_ID:0:8}..."
   fi
+  
   if [[ "$CFG_PLATFORM" == "vercel" ]]; then
     echo -e "  ${C_WHITE}MAX_INFLIGHT    :${C_RESET} $CFG_MAX_INFLIGHT"
     echo -e "  ${C_WHITE}MAX_UP_BPS      :${C_RESET} $CFG_MAX_UP_BPS"
@@ -693,6 +736,7 @@ phase3_collect_input() {
     echo -e "  ${C_WHITE}SUCCESS_DUR_MS  :${C_RESET} $CFG_SUCCESS_DUR"
     echo -e "  ${C_WHITE}ERROR_INT_MS    :${C_RESET} $CFG_ERROR_INT"
   fi
+  
   echo -e "  ${C_CYAN}─────────────────────────────────────${C_RESET}"
   echo ""
   if ! confirm "Proceed with these settings?"; then
@@ -700,6 +744,7 @@ phase3_collect_input() {
     exit 0
   fi
 }
+
 
 # =============================================================
 #  PHASE 4a — SSL WITH acme.sh
@@ -1851,13 +1896,304 @@ phase4c_netlify_deploy() {
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# phase4c_cloudflare_deploy
+# ─────────────────────────────────────────────────────────────────────────────
+phase4c_cloudflare_deploy() {
+  local CLOUDFLARE_DIR="${SCRIPT_DIR}/deploy/cloudflare"
+  
+  if [[ ! -d "$CLOUDFLARE_DIR" ]]; then
+    log_error "Cloudflare deploy directory not found: $CLOUDFLARE_DIR"
+    return 1
+  fi
+
+  log_info "Starting Cloudflare Workers deployment..."
+  
+  # Set target domain
+  local TARGET_DOMAIN_VAL="https://${CFG_DOMAIN}:${CFG_INBOUND_PORT}"
+  
+  # Step 1: Install Wrangler CLI
+  _cloudflare_install_wrangler || return 1
+  
+  # Step 2: Validate API token
+  _cloudflare_validate_token || return 1
+  
+  # Step 3: Deploy worker
+  _cloudflare_deploy_worker || return 1
+  
+  # Step 4: Set environment secrets
+  _cloudflare_set_secrets "$TARGET_DOMAIN_VAL" || return 1
+  
+  # Step 5: Verify deployment
+  _cloudflare_verify_deployment || return 1
+  
+  log_success "Cloudflare Workers deployment completed successfully!"
+  log_info "Worker URL: ${CLOUDFLARE_WORKER_URL}"
+  
+  return 0
+}
+# ─────────────────────────────────────────────────────────────────────────────
+# _cloudflare_install_wrangler
+# ─────────────────────────────────────────────────────────────────────────────
+_cloudflare_install_wrangler() {
+  log_info "Checking Wrangler CLI..."
+  
+  if command -v wrangler &>/dev/null; then
+    local ver
+    ver=$(wrangler --version 2>/dev/null | head -n1)
+    log_success "Wrangler already installed: $ver"
+    return 0
+  fi
+  
+  log_info "Installing Wrangler CLI via npm..."
+  
+  # Check if npm is available
+  if ! command -v npm &>/dev/null; then
+    log_error "npm not found. Installing Node.js and npm..."
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y nodejs npm
+    elif command -v yum &>/dev/null; then
+      sudo yum install -y nodejs npm
+    else
+      log_error "Cannot install Node.js automatically. Please install manually."
+      return 1
+    fi
+  fi
+  
+  # Install wrangler globally
+  if ! sudo npm install -g wrangler@latest; then
+    log_error "Failed to install Wrangler CLI"
+    return 1
+  fi
+  
+  log_success "Wrangler CLI installed successfully"
+  return 0
+}
+# ─────────────────────────────────────────────────────────────────────────────
+# _cloudflare_validate_token
+# ─────────────────────────────────────────────────────────────────────────────
+_cloudflare_validate_token() {
+  log_info "Validating Cloudflare API token..."
+  
+  local attempt=0
+  local max_attempts=3
+  
+  while (( attempt < max_attempts )); do
+    ((attempt++))
+    
+    # Test token by fetching account info
+    local response
+    response=$(curl -s -X GET "https://api.cloudflare.com/v4/accounts/${CFG_CLOUDFLARE_ACCOUNT_ID}" \
+      -H "Authorization: Bearer ${CFG_CLOUDFLARE_API_TOKEN}" \
+      -H "Content-Type: application/json")
+    
+    if echo "$response" | grep -q '"success":true'; then
+      log_success "API token validated successfully"
+      return 0
+    fi
+    
+    log_warn "Token validation failed (attempt $attempt/$max_attempts)"
+    
+    if (( attempt >= max_attempts )); then
+      log_error "API token validation failed after $max_attempts attempts"
+      log_error "Response: $response"
+      
+      # Prompt for new token
+      echo ""
+      log_warn "Please provide a valid Cloudflare API token:"
+      read_secret "Cloudflare API Token" CFG_CLOUDFLARE_API_TOKEN
+    fi
+  done
+  
+  return 1
+}
+# ─────────────────────────────────────────────────────────────────────────────
+# _cloudflare_deploy_worker
+# ─────────────────────────────────────────────────────────────────────────────
+_cloudflare_deploy_worker() {
+  log_info "Deploying Cloudflare Worker..."
+  
+  local CLOUDFLARE_DIR="${SCRIPT_DIR}/deploy/cloudflare"
+  cd "$CLOUDFLARE_DIR" || return 1
+  
+  # Create wrangler.toml if not exists
+  if [[ ! -f "wrangler.toml" ]]; then
+    log_info "Creating wrangler.toml configuration..."
+    cat > wrangler.toml <<EOF
+name = "${CFG_CLOUDFLARE_WORKER_NAME}"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[env.production]
+workers_dev = false
+EOF
+  fi
+  
+  # Set environment variables for wrangler
+  export CLOUDFLARE_API_TOKEN="${CFG_CLOUDFLARE_API_TOKEN}"
+  export CLOUDFLARE_ACCOUNT_ID="${CFG_CLOUDFLARE_ACCOUNT_ID}"
+  
+  local attempt=0
+  local max_attempts=3
+  local deploy_output
+  
+  while (( attempt < max_attempts )); do
+    ((attempt++))
+    log_info "Deploy attempt $attempt/$max_attempts..."
+    
+    deploy_output=$(wrangler deploy 2>&1)
+    local exit_code=$?
+    
+    # Check for success
+    if [[ $exit_code -eq 0 ]] && echo "$deploy_output" | grep -qE "(Published|Deployed|workers\.dev)"; then
+      # Extract worker URL
+      CLOUDFLARE_WORKER_URL=$(echo "$deploy_output" | grep -oP 'https://[a-zA-Z0-9_-]+\.workers\.dev' | head -n1)
+      
+      if [[ -z "$CLOUDFLARE_WORKER_URL" ]]; then
+        # Construct URL from worker name
+        CLOUDFLARE_WORKER_URL="https://${CFG_CLOUDFLARE_WORKER_NAME}.workers.dev"
+      fi
+      
+      log_success "Worker deployed successfully"
+      log_info "Worker URL: $CLOUDFLARE_WORKER_URL"
+      return 0
+    fi
+    
+    # Check for specific errors
+    if echo "$deploy_output" | grep -qiE "(authentication|unauthorized|invalid token|401)"; then
+      log_error "Authentication failed. Please check your API token."
+      return 1
+    fi
+    
+    if echo "$deploy_output" | grep -qiE "(account.*not found|invalid account|403)"; then
+      log_error "Account ID invalid or inaccessible."
+      return 1
+    fi
+    
+    log_warn "Deploy failed: $deploy_output"
+    
+    if (( attempt < max_attempts )); then
+      log_info "Retrying in 3 seconds..."
+      sleep 3
+    fi
+  done
+  
+  log_error "Worker deployment failed after $max_attempts attempts"
+  return 1
+}
+# ─────────────────────────────────────────────────────────────────────────────
+# _cloudflare_set_secrets
+# ─────────────────────────────────────────────────────────────────────────────
+_cloudflare_set_secrets() {
+  local target_domain="$1"
+  log_info "Setting environment secrets..."
+  
+  local CLOUDFLARE_DIR="${SCRIPT_DIR}/deploy/cloudflare"
+  cd "$CLOUDFLARE_DIR" || return 1
+  
+  # Set TARGET_DOMAIN secret
+  log_info "Setting TARGET_DOMAIN secret..."
+  
+  local attempt=0
+  local max_attempts=3
+  
+  while (( attempt < max_attempts )); do
+    ((attempt++))
+    
+    # Use wrangler secret put
+    if echo "$target_domain" | wrangler secret put TARGET_DOMAIN 2>&1 | grep -qiE "(success|uploaded)"; then
+      log_success "TARGET_DOMAIN secret set successfully"
+      return 0
+    fi
+    
+    log_warn "Failed to set secret (attempt $attempt/$max_attempts)"
+    
+    if (( attempt < max_attempts )); then
+      sleep 2
+    fi
+  done
+  
+  # Fallback: use Cloudflare API directly
+  log_info "Trying direct API method..."
+  
+  local response
+  response=$(curl -s -X PUT \
+    "https://api.cloudflare.com/v4/accounts/${CFG_CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${CFG_CLOUDFLARE_WORKER_NAME}/secrets" \
+    -H "Authorization: Bearer ${CFG_CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "{\"name\":\"TARGET_DOMAIN\",\"text\":\"${target_domain}\",\"type\":\"secret_text\"}")
+  
+  if echo "$response" | grep -q '"success":true'; then
+    log_success "TARGET_DOMAIN secret set via API"
+    return 0
+  fi
+  
+  log_error "Failed to set secrets after all attempts"
+  return 1
+}
+# ─────────────────────────────────────────────────────────────────────────────
+# _cloudflare_verify_deployment
+# ─────────────────────────────────────────────────────────────────────────────
+_cloudflare_verify_deployment() {
+  log_info "Verifying worker deployment..."
+  
+  if [[ -z "$CLOUDFLARE_WORKER_URL" ]]; then
+    log_error "Worker URL not found"
+    return 1
+  fi
+  
+  local test_url="${CLOUDFLARE_WORKER_URL}${CFG_PUBLIC_PATH}"
+  local attempt=0
+  local max_attempts=5
+  
+  while (( attempt < max_attempts )); do
+    ((attempt++))
+    log_info "Verification attempt $attempt/$max_attempts..."
+    
+    local response
+    response=$(curl -s -X POST "$test_url" \
+      -H "Content-Type: application/json" \
+      -d '{"action":"ping"}' \
+      --max-time 10)
+    
+    # Check for success
+    if echo "$response" | grep -q '"pong"'; then
+      log_success "Worker is responding correctly!"
+      return 0
+    fi
+    
+    # Check for common errors
+    if echo "$response" | grep -qiE "(TARGET_DOMAIN.*not.*defined|environment variable|missing secret)"; then
+      log_warn "TARGET_DOMAIN secret not propagated yet, retrying..."
+    elif echo "$response" | grep -qiE "(404|not found)"; then
+      log_warn "Worker route not active yet, retrying..."
+    else
+      log_warn "Unexpected response: $response"
+    fi
+    
+    if (( attempt < max_attempts )); then
+      log_info "Waiting 5 seconds before retry..."
+      sleep 5
+    fi
+  done
+  
+  log_error "Worker verification failed after $max_attempts attempts"
+  log_error "Please check worker logs at: https://dash.cloudflare.com/"
+  return 1
+}
+
+
 phase4c_deploy() {
   if [[ "${CFG_PLATFORM:-vercel}" == "netlify" ]]; then
     phase4c_netlify_deploy
+  elif [[ "${CFG_PLATFORM}" == "cloudflare" ]]; then
+    phase4c_cloudflare_deploy
   else
     phase4c_vercel_deploy
   fi
 }
+
 
 # helper — redeploy ENV after user corrects a value
 _redeploy_env_fix() {
@@ -3012,6 +3348,7 @@ ensure_screen_session() {
 # =============================================================
 #  ENTRYPOINT
 # =============================================================
+
 main() {
   print_banner
   ensure_screen_session
@@ -3024,12 +3361,14 @@ main() {
   echo -e "  ${C_WHITE}Choose relay platform:${C_RESET}"
   echo -e "    ${C_YELLOW}1${C_RESET}) Vercel"
   echo -e "    ${C_YELLOW}2${C_RESET}) Netlify"
+  echo -e "    ${C_YELLOW}3${C_RESET}) Cloudflare Workers"
   while true; do
-    read -rp "$(echo -e "  ${C_WHITE}Enter choice [1/2]${C_RESET}: ")" plat_choice
+    read -rp "$(echo -e "  ${C_WHITE}Enter choice [1/2/3]${C_RESET}: ")" plat_choice
     case "$plat_choice" in
-      1) CFG_PLATFORM="vercel";  break ;;
-      2) CFG_PLATFORM="netlify"; break ;;
-      *) fail "Enter 1 for Vercel or 2 for Netlify" ;;
+      1) CFG_PLATFORM="vercel";     break ;;
+      2) CFG_PLATFORM="netlify";    break ;;
+      3) CFG_PLATFORM="cloudflare"; break ;;
+      *) fail "Enter 1 for Vercel, 2 for Netlify, or 3 for Cloudflare Workers" ;;
     esac
   done
   ok "Platform: ${CFG_PLATFORM}"
@@ -3048,5 +3387,6 @@ main() {
   phase7_install_panel
   phase6_summary
 }
+
 
 main "$@"
